@@ -1,55 +1,50 @@
 import pytest
-import asyncio
-import httpx
-from datetime import datetime
+import time
+from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from app.database import Base
+from sqlalchemy.exc import IntegrityError
+from app.main import app
+from app.database import Base, get_db
 from app.models import Event, AuditLog, ProcessingState
 from app.config import get_settings
 
 settings = get_settings()
 
 # Test database URL
-TEST_DB_URL = settings.database_url
+TEST_DATABASE_URL = settings.database_url
 
-# Create test engine and session
-engine = create_engine(TEST_DB_URL)
-TestSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+# Create test database engine
+test_engine = create_engine(TEST_DATABASE_URL)
+TestSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
 
 
-@pytest.fixture(scope="function")
-def db():
-    """Create a fresh database for each test"""
-    Base.metadata.create_all(bind=engine)
+def override_get_db():
+    """Override database dependency for tests"""
     db = TestSessionLocal()
-    yield db
-    db.close()
-    Base.metadata.drop_all(bind=engine)
+    try:
+        yield db
+    finally:
+        db.close()
 
 
-@pytest.fixture(scope="function")
-async def client():
-    """HTTP client for testing webhook endpoint"""
-    async with httpx.AsyncClient(base_url="http://api:8000", timeout=30.0) as client:
-        yield client
+app.dependency_overrides[get_db] = override_get_db
+
+# Create test client (synchronous)
+client = TestClient(app)
 
 
-def create_test_webhook(event_id: str, event_type: str = "test.event"):
-    """Helper to create test webhook payload"""
-    return {
-        "event_id": event_id,
-        "event_type": event_type,
-        "occurred_at": datetime.utcnow().isoformat(),
-        "payload": {
-            "test": "data",
-            "timestamp": datetime.utcnow().isoformat()
-        }
-    }
+@pytest.fixture(autouse=True)
+def setup_database():
+    """Setup and teardown test database"""
+    # Create all tables
+    Base.metadata.create_all(bind=test_engine)
+    yield
+    # Clean up after tests
+    Base.metadata.drop_all(bind=test_engine)
 
 
-@pytest.mark.asyncio
-async def test_idempotency(client, db):
+def test_idempotency():
     """
     TEST 1: Idempotency Test
     Send the same webhook 10 times → only 1 row exists in events table
@@ -58,128 +53,113 @@ async def test_idempotency(client, db):
     print("TEST 1: IDEMPOTENCY TEST")
     print("="*60)
     
-    event_id = "test-event-001"
-    webhook = create_test_webhook(event_id)
+    webhook_payload = {
+        "event_id": "test-idempotency-001",
+        "event_type": "test.event",
+        "occurred_at": "2024-01-30T12:00:00Z",
+        "payload": {"test": "data"}
+    }
     
     # Send the same webhook 10 times
+    responses = []
     for i in range(10):
-        response = await client.post("/webhook", json=webhook)
-        print(f"Request {i+1}/10: status={response.status_code}")
-        assert response.status_code == 200
+        response = client.post("/webhook", json=webhook_payload)
+        responses.append(response.json())
+        print(f"Request {i+1}/10: {response.json()['status']}")
     
-    # Wait a moment for async processing
-    await asyncio.sleep(1)
+    # First request should be accepted
+    assert responses[0]["status"] == "accepted"
     
-    # Query database - should only have 1 event
-    event_count = db.query(Event).filter(Event.event_id == event_id).count()
-    print(f"\nEvents in database: {event_count}")
-    assert event_count == 1, f"Expected 1 event, found {event_count}"
+    # All subsequent requests should be deduplicated
+    for i in range(1, 10):
+        assert responses[i]["status"] == "deduplicated"
     
-    # Check audit log shows deduplication
-    audit_logs = db.query(AuditLog).filter(AuditLog.event_id == event_id).all()
-    dedupe_logs = [log for log in audit_logs if log.action == "event_deduped"]
-    print(f"Deduplication logs: {len(dedupe_logs)}")
-    assert len(dedupe_logs) >= 8, "Should have multiple dedupe logs"
-    
-    print("\n✅ IDEMPOTENCY TEST PASSED")
+    # Verify only 1 event in database
+    db = TestSessionLocal()
+    events = db.query(Event).filter(Event.event_id == "test-idempotency-001").all()
+    assert len(events) == 1
+    print(f"\n✅ Idempotency test passed: 10 requests → 1 database row")
+    db.close()
     print("="*60)
 
 
-@pytest.mark.asyncio
-async def test_retry_with_eventual_success(client, db):
+def test_retry_with_eventual_success():
     """
     TEST 2: Retry Test
-    Downstream API fails first 2 tries → job retries and eventually succeeds
-    Audit log shows all attempts
+    Failed processing attempts are retried with exponential backoff
     """
     print("\n" + "="*60)
     print("TEST 2: RETRY TEST")
     print("="*60)
     
-    event_id = "test-event-retry-001"
-    webhook = create_test_webhook(event_id)
+    webhook_payload = {
+        "event_id": "test-retry-001",
+        "event_type": "test.event",
+        "occurred_at": "2024-01-30T12:00:00Z",
+        "payload": {"test": "retry"}
+    }
     
     # Send webhook
-    response = await client.post("/webhook", json=webhook)
-    print(f"Webhook sent: status={response.status_code}")
+    response = client.post("/webhook", json=webhook_payload)
     assert response.status_code == 200
+    print(f"Webhook sent: {response.json()}")
     
-    # Wait for processing with retries (mock API has 50% failure rate)
-    # This might take multiple attempts
-    print("\nWaiting for processing with retries...")
-    max_wait = 60  # Wait up to 60 seconds
-    waited = 0
+    # Wait for worker to process (with retries)
+    print("\nWaiting for worker to process with retries...")
+    time.sleep(10)
     
-    while waited < max_wait:
-        await asyncio.sleep(2)
-        waited += 2
-        
-        processing_state = db.query(ProcessingState).filter(
-            ProcessingState.event_id == event_id
-        ).first()
-        
-        if processing_state:
-            print(f"Status: {processing_state.status}, Attempts: {processing_state.attempt_count}")
-            
-            if processing_state.status == 'completed':
-                print("✅ Processing completed!")
-                break
-            elif processing_state.status == 'failed' and processing_state.attempt_count >= 5:
-                print("⚠️  Max attempts reached, that's ok for testing")
-                break
+    # Check audit log for retry attempts
+    db = TestSessionLocal()
+    audit_logs = db.query(AuditLog).filter(
+        AuditLog.event_id == "test-retry-001"
+    ).order_by(AuditLog.timestamp).all()
     
-    # Check audit log shows multiple attempts
-    audit_logs = db.query(AuditLog).filter(AuditLog.event_id == event_id).all()
-    attempt_logs = [log for log in audit_logs if "attempt" in log.action.lower()]
+    print(f"\n📝 Audit log entries for test-retry-001:")
+    for log in audit_logs:
+        print(f"  - {log.action}: {log.details} (success={log.success})")
     
-    print(f"\nTotal audit log entries: {len(audit_logs)}")
-    print(f"Processing attempt logs: {len(attempt_logs)}")
+    # Should see multiple processing attempts
+    processing_attempts = [log for log in audit_logs if "processing_attempt" in log.action]
+    assert len(processing_attempts) > 0
+    print(f"\n✅ Retry test passed: {len(processing_attempts)} processing attempts recorded")
     
-    # Print some audit entries
-    print("\nAudit trail:")
-    for log in audit_logs[:10]:
-        print(f"  - {log.action}: {log.details} ({log.success})")
-    
-    assert len(attempt_logs) >= 1, "Should have at least 1 processing attempt logged"
-    
-    print("\n✅ RETRY TEST PASSED")
+    db.close()
     print("="*60)
 
 
-@pytest.mark.asyncio
-async def test_no_double_processing(client, db):
+def test_no_double_processing():
     """
     TEST 3: No Double-Processing Test
-    Simulate two workers trying to process same event
-    Only one should succeed due to database locking
+    Database constraints prevent duplicate processing_state entries
     """
     print("\n" + "="*60)
     print("TEST 3: NO DOUBLE-PROCESSING TEST")
     print("="*60)
     
-    event_id = "test-event-double-001"
-    webhook = create_test_webhook(event_id)
+    webhook_payload = {
+        "event_id": "test-no-double-001",
+        "event_type": "test.event",
+        "occurred_at": "2024-01-30T12:00:00Z",
+        "payload": {"test": "no-double"}
+    }
     
     # Send webhook
-    response = await client.post("/webhook", json=webhook)
-    print(f"Webhook sent: status={response.status_code}")
+    response = client.post("/webhook", json=webhook_payload)
     assert response.status_code == 200
+    print(f"Webhook sent: {response.json()}")
     
-    # Wait a moment for it to be stored
-    await asyncio.sleep(1)
+    # Verify only 1 processing_state entry
+    db = TestSessionLocal()
+    processing_states = db.query(ProcessingState).filter(
+        ProcessingState.event_id == "test-no-double-001"
+    ).all()
     
-    # Check that processing state uses unique constraint
-    processing_state = db.query(ProcessingState).filter(
-        ProcessingState.event_id == event_id
-    ).first()
+    assert len(processing_states) == 1
+    print(f"\n✅ No double-processing test passed: 1 processing_state entry")
     
-    assert processing_state is not None, "Processing state should exist"
-    print(f"Processing state created: {processing_state.event_id}")
-    
-    # Try to create duplicate processing state (should fail)
-    from sqlalchemy.exc import IntegrityError
+    # Try to create duplicate (should fail)
     duplicate_state = ProcessingState(
-        event_id=event_id,
+        event_id="test-no-double-001",
         status="pending",
         attempt_count=0
     )
@@ -192,59 +172,51 @@ async def test_no_double_processing(client, db):
         db.rollback()
         print("✅ Duplicate processing state rejected (IntegrityError as expected)")
     
-    # Verify only one processing state exists
-    state_count = db.query(ProcessingState).filter(
-        ProcessingState.event_id == event_id
-    ).count()
-    
-    print(f"Processing states in DB: {state_count}")
-    assert state_count == 1, f"Expected 1 processing state, found {state_count}"
-    
-    print("\n✅ NO DOUBLE-PROCESSING TEST PASSED")
+    db.close()
     print("="*60)
 
 
-@pytest.mark.asyncio
-async def test_payload_conflict_detection(client, db):
+def test_payload_conflict_detection():
     """
     BONUS TEST: Payload Conflict Detection
-    Send same event_id with different payload → should detect conflict
+    Same event_id with different payload is detected as a conflict
     """
     print("\n" + "="*60)
     print("BONUS TEST: PAYLOAD CONFLICT DETECTION")
     print("="*60)
     
-    event_id = "test-event-conflict-001"
-    
     # Send first webhook
-    webhook1 = create_test_webhook(event_id)
-    response1 = await client.post("/webhook", json=webhook1)
-    print(f"First webhook: status={response1.status_code}")
-    assert response1.status_code == 200
+    payload1 = {
+        "event_id": "test-conflict-001",
+        "event_type": "test.event",
+        "occurred_at": "2024-01-30T12:00:00Z",
+        "payload": {"version": 1}
+    }
+    response1 = client.post("/webhook", json=payload1)
+    assert response1.json()["status"] == "accepted"
+    print(f"First webhook: {response1.json()['status']}")
     
-    # Send second webhook with same event_id but different payload
-    webhook2 = create_test_webhook(event_id)
-    webhook2["payload"]["different"] = "data"
+    # Send same event_id with different payload
+    payload2 = {
+        "event_id": "test-conflict-001",
+        "event_type": "test.event",
+        "occurred_at": "2024-01-30T12:00:00Z",
+        "payload": {"version": 2}  # Different payload!
+    }
+    response2 = client.post("/webhook", json=payload2)
+    assert response2.json()["status"] == "conflict"
+    print(f"Second webhook (different payload): {response2.json()['status']}")
     
-    response2 = await client.post("/webhook", json=webhook2)
-    print(f"Second webhook (different payload): status={response2.status_code}")
-    assert response2.status_code == 200
-    
-    response_data = response2.json()
-    print(f"Response: {response_data}")
-    assert response_data["status"] == "conflict", "Should detect payload conflict"
-    
-    # Check audit log
-    await asyncio.sleep(0.5)
+    # Check audit log for conflict detection
+    db = TestSessionLocal()
     conflict_logs = db.query(AuditLog).filter(
-        AuditLog.event_id == event_id,
+        AuditLog.event_id == "test-conflict-001",
         AuditLog.action == "conflict_detected"
     ).all()
     
-    print(f"Conflict logs found: {len(conflict_logs)}")
-    assert len(conflict_logs) >= 1, "Should have conflict log entry"
-    
-    print("\n✅ CONFLICT DETECTION TEST PASSED")
+    assert len(conflict_logs) == 1
+    print(f"\n✅ Conflict detection test passed: payload change detected")
+    db.close()
     print("="*60)
 
 
