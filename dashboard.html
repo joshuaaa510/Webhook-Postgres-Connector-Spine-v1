@@ -139,7 +139,7 @@
     </div>
 
     <script>
-        const API_URL = 'https://webhook-postgres-connector-spine-v1-production.up.railway.app/dashboard'; // Replace with your Railway URL
+        const API_URL = 'https://webhook-postgres-connector-spine-v1-production.up.railway.app'; // Replace with your Railway URL
         
         async function sendWebhook(isDuplicate = false) {
             const eventId = isDuplicate ? document.getElementById('eventId').value : 
