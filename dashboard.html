@@ -139,7 +139,10 @@
     </div>
 
     <script>
-        const API_URL = 'https://webhook-postgres-connector-spine-v1-production.up.railway.app'; // Replace with your Railway URL
+        // Auto-detect: use localhost if running locally, otherwise use current domain
+        const API_URL = window.location.hostname === 'localhost' 
+            ? 'http://localhost:8000' 
+            : window.location.origin;
         
         async function sendWebhook(isDuplicate = false) {
             const eventId = isDuplicate ? document.getElementById('eventId').value : 
