@@ -1,0 +1,80 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: webhook_connector
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Redis (for Arq background jobs - optional for this simple version)
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # Main API Service
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/webhook_connector
+      - REDIS_URL=redis://redis:6379
+      - MOCK_API_URL=http://mock-api:8001
+      - MOCK_API_FAILURE_RATE=0.5
+      - LOG_LEVEL=INFO
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mock-api:
+        condition: service_started
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # Background Worker
+  worker:
+    build: .
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/webhook_connector
+      - REDIS_URL=redis://redis:6379
+      - MOCK_API_URL=http://mock-api:8001
+      - MOCK_API_FAILURE_RATE=0.5
+      - LOG_LEVEL=INFO
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mock-api:
+        condition: service_started
+    command: python -m app.worker
+
+  # Mock Third-Party API (simulates external service)
+  mock-api:
+    build: .
+    ports:
+      - "8001:8001"
+    environment:
+      - MOCK_API_FAILURE_RATE=0.5
+    command: uvicorn app.mock_api:app --host 0.0.0.0 --port 8001
+
+volumes:
+  postgres_data:
