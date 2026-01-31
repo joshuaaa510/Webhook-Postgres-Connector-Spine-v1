@@ -184,6 +184,45 @@ def trigger_processing(event_id: str):
     # The worker.py will handle actual processing
 
 
+@app.get("/api/events")
+async def get_events(db: Session = Depends(get_db)):
+    """Get all events"""
+    events = db.query(Event).order_by(Event.created_at.desc()).limit(50).all()
+    return [{
+        "event_id": e.event_id,
+        "event_type": e.event_type,
+        "created_at": str(e.created_at),
+        "payload": e.payload
+    } for e in events]
+
+
+@app.get("/api/audit")
+async def get_audit_log(db: Session = Depends(get_db)):
+    """Get audit log"""
+    logs = db.query(AuditLog).order_by(AuditLog.timestamp.desc()).limit(100).all()
+    return [{
+        "timestamp": str(l.timestamp),
+        "event_id": l.event_id,
+        "action": l.action,
+        "details": l.details,
+        "success": l.success
+    } for l in logs]
+
+
+@app.get("/api/processing")
+async def get_processing_state(db: Session = Depends(get_db)):
+    """Get processing states"""
+    states = db.query(ProcessingState).order_by(ProcessingState.updated_at.desc()).limit(50).all()
+    return [{
+        "event_id": s.event_id,
+        "status": s.status,
+        "attempt_count": s.attempt_count,
+        "last_attempt_at": str(s.last_attempt_at) if s.last_attempt_at else None,
+        "completed_at": str(s.completed_at) if s.completed_at else None,
+        "error_message": s.error_message
+    } for s in states]
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
