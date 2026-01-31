@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Webhook Connector Dashboard</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { 
+            font-family: system-ui, -apple-system, sans-serif; 
+            background: #0f172a; 
+            color: #e2e8f0;
+            padding: 20px;
+        }
+        .container { max-width: 1400px; margin: 0 auto; }
+        h1 { margin-bottom: 30px; color: #60a5fa; }
+        h2 { margin: 20px 0 10px 0; color: #93c5fd; font-size: 18px; }
+        
+        .controls {
+            background: #1e293b;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 30px;
+        }
+        
+        input, button {
+            padding: 10px 15px;
+            border-radius: 6px;
+            border: 1px solid #334155;
+            font-size: 14px;
+        }
+        
+        input {
+            background: #0f172a;
+            color: #e2e8f0;
+            width: 300px;
+            margin-right: 10px;
+        }
+        
+        button {
+            background: #3b82f6;
+            color: white;
+            cursor: pointer;
+            border: none;
+        }
+        
+        button:hover { background: #2563eb; }
+        
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+            gap: 20px;
+        }
+        
+        .panel {
+            background: #1e293b;
+            padding: 20px;
+            border-radius: 8px;
+            max-height: 600px;
+            overflow-y: auto;
+        }
+        
+        .log-entry {
+            background: #0f172a;
+            padding: 12px;
+            margin-bottom: 8px;
+            border-radius: 6px;
+            border-left: 3px solid #334155;
+            font-size: 13px;
+        }
+        
+        .log-entry.success { border-left-color: #10b981; }
+        .log-entry.failure { border-left-color: #ef4444; }
+        .log-entry.pending { border-left-color: #f59e0b; }
+        
+        .event-id { 
+            color: #60a5fa; 
+            font-family: monospace; 
+            font-size: 12px;
+        }
+        
+        .timestamp {
+            color: #64748b;
+            font-size: 11px;
+        }
+        
+        .status {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: 600;
+        }
+        
+        .status.completed { background: #10b981; color: white; }
+        .status.pending { background: #f59e0b; color: white; }
+        .status.processing { background: #3b82f6; color: white; }
+        .status.failed { background: #ef4444; color: white; }
+        
+        .response {
+            margin-top: 10px;
+            padding: 10px;
+            background: #0f172a;
+            border-radius: 4px;
+            font-family: monospace;
+            font-size: 12px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔗 Webhook Connector Dashboard</h1>
+        
+        <div class="controls">
+            <h2>Send Test Webhook</h2>
+            <input type="text" id="eventId" placeholder="Event ID (e.g., test-001)" value="test-001">
+            <button onclick="sendWebhook()">Send Webhook</button>
+            <button onclick="sendWebhook(true)">Send Duplicate (Test Idempotency)</button>
+            <button onclick="refreshData()">Refresh Data</button>
+            <div id="response" class="response" style="display: none;"></div>
+        </div>
+        
+        <div class="grid">
+            <div class="panel">
+                <h2>📊 Events (Idempotent Storage)</h2>
+                <div id="events"></div>
+            </div>
+            
+            <div class="panel">
+                <h2>📝 Audit Log (Everything Tracked)</h2>
+                <div id="audit"></div>
+            </div>
+            
+            <div class="panel">
+                <h2>⚙️ Processing States (Retry Status)</h2>
+                <div id="processing"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const API_URL = 'YOUR_RAILWAY_URL_HERE'; // Replace with your Railway URL
+        
+        async function sendWebhook(isDuplicate = false) {
+            const eventId = isDuplicate ? document.getElementById('eventId').value : 
+                           document.getElementById('eventId').value + '-' + Date.now();
+            
+            const payload = {
+                event_id: eventId,
+                event_type: "test.event",
+                occurred_at: new Date().toISOString(),
+                payload: {
+                    test: "data",
+                    timestamp: new Date().toISOString(),
+                    random: Math.random()
+                }
+            };
+            
+            try {
+                const response = await fetch(`${API_URL}/webhook`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                
+                const data = await response.json();
+                const responseDiv = document.getElementById('response');
+                responseDiv.style.display = 'block';
+                responseDiv.textContent = JSON.stringify(data, null, 2);
+                
+                // Refresh data after sending
+                setTimeout(refreshData, 1000);
+            } catch (error) {
+                alert('Error: ' + error.message);
+            }
+        }
+        
+        async function refreshData() {
+            await Promise.all([
+                loadEvents(),
+                loadAuditLog(),
+                loadProcessingStates()
+            ]);
+        }
+        
+        async function loadEvents() {
+            try {
+                const response = await fetch(`${API_URL}/api/events`);
+                const events = await response.json();
+                
+                const html = events.map(e => `
+                    <div class="log-entry">
+                        <div class="event-id">${e.event_id}</div>
+                        <div>${e.event_type}</div>
+                        <div class="timestamp">${e.created_at}</div>
+                    </div>
+                `).join('');
+                
+                document.getElementById('events').innerHTML = html || '<p>No events yet</p>';
+            } catch (error) {
+                console.error('Error loading events:', error);
+            }
+        }
+        
+        async function loadAuditLog() {
+            try {
+                const response = await fetch(`${API_URL}/api/audit`);
+                const logs = await response.json();
+                
+                const html = logs.map(l => `
+                    <div class="log-entry ${l.success}">
+                        <div class="event-id">${l.event_id}</div>
+                        <div><strong>${l.action}</strong></div>
+                        <div>${l.details || ''}</div>
+                        <div class="timestamp">${l.timestamp}</div>
+                    </div>
+                `).join('');
+                
+                document.getElementById('audit').innerHTML = html || '<p>No audit logs yet</p>';
+            } catch (error) {
+                console.error('Error loading audit log:', error);
+            }
+        }
+        
+        async function loadProcessingStates() {
+            try {
+                const response = await fetch(`${API_URL}/api/processing`);
+                const states = await response.json();
+                
+                const html = states.map(s => `
+                    <div class="log-entry">
+                        <div class="event-id">${s.event_id}</div>
+                        <span class="status ${s.status}">${s.status}</span>
+                        <div>Attempts: ${s.attempt_count}</div>
+                        ${s.error_message ? `<div style="color: #ef4444;">${s.error_message}</div>` : ''}
+                        <div class="timestamp">${s.last_attempt_at || 'Not started'}</div>
+                    </div>
+                `).join('');
+                
+                document.getElementById('processing').innerHTML = html || '<p>No processing states yet</p>';
+            } catch (error) {
+                console.error('Error loading processing states:', error);
+            }
+        }
+        
+        // Load data on page load
+        refreshData();
+        
+        // Auto-refresh every 3 seconds
+        setInterval(refreshData, 3000);
+    </script>
+</body>
+</html>
