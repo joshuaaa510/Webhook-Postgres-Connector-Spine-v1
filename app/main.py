@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from datetime import datetime
 from sqlalchemy.orm import Session
@@ -184,40 +185,14 @@ def trigger_processing(event_id: str):
     # The worker.py will handle actual processing
 
 
-
-from fastapi.responses import HTMLResponse
-
-@app.get("/dashboard", response_class=HTMLResponse)
-async def dashboard():
-    """Serve the dashboard"""
-    html_content = """
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Webhook Connector Dashboard</title>
-        [... rest of the dashboard HTML I sent earlier ...]
-    </head>
-    <body>
-    [... rest of HTML ...]
-    </body>
-    </html>
-    """
-    return html_content
-
-@app.get("/api/events")
-async def get_events(db: Session = Depends(get_db)):
-    """Get all events"""
-    events = db.query(Event).order_by(Event.created_at.desc()).limit(50).all()
-    return [{
-        "event_id": e.event_id,
-        "event_type": e.event_type,
-        "created_at": str(e.created_at),
-        "payload": e.payload
-    } for e in events]
+# Dashboard endpoint - serves the dashboard.html file
+@app.get("/dashboard")
+async def serve_dashboard():
+    """Serve the dashboard HTML file"""
+    return FileResponse("dashboard.html")
 
 
+# API endpoints for dashboard data
 @app.get("/api/events")
 async def get_events(db: Session = Depends(get_db)):
     """Get all events"""
@@ -255,10 +230,6 @@ async def get_processing_state(db: Session = Depends(get_db)):
         "completed_at": str(s.completed_at) if s.completed_at else None,
         "error_message": s.error_message
     } for s in states]
-
-
-
-
 
 
 if __name__ == "__main__":
